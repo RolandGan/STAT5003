@@ -1,0 +1,849 @@
+---
+title: "5003_Final Project"
+author: "Workshop 09 Group 02"
+date: "2025-05-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+## Dimensionality Reduction with PCA
+To enhance model performance and reduce data redundancy, Principal Component Analysis (PCA) was applied to the dataset. A random sample of 10,000 records was selected, and the original 18 features were transformed into 11 principal components. These components collectively capture over 80% of the total variance, while remaining uncorrelated. This transformation not only helps mitigate multicollinearity but also contributes to noise reduction and improved computational efficiency during model training.
+!['PCA Cumulative Variance Explained'](PCA Cumulative Variance Explained.png)
+<details>
+<summary>Click to expand</summary>
+```{r}
+
+library(tidyverse)    # For data manipulation
+library(caret)        # For machine learning workflow
+library(MASS)         # For LDA and QDA
+library(e1071)        # For SVM
+library(randomForest) # For Random Forest
+library(class)        # For k-NN
+library(rpart)        # For Decision Trees
+library(pROC)         # For ROC curves
+library(factoextra)   # For PCA visualization
+
+# Set seed for reproducibility
+set.seed(123)
+setwd("/Users/maverick/Desktop/STAT5003/ASS2/Report")
+
+full_credit_data <- read.csv("train_cleaned_scaled_2.csv", header=TRUE, stringsAsFactors=FALSE)
+sampled_indices <- sample(1:nrow(full_credit_data), 10000)
+credit_data <- full_credit_data[sampled_indices, ]
+
+# Convert Credit_Score to factor (required for classification)
+credit_data$Credit_Score <- as.factor(credit_data$Credit_Score)
+
+# Store the target variable separately
+credit_score <- credit_data$Credit_Score
+
+# Remove target variable for PCA
+credit_data_for_pca <- credit_data[, -which(names(credit_data) == "Credit_Score")]
+
+# Scale the data (important for PCA)
+scaled_data <- scale(credit_data_for_pca)
+
+# Perform PCA
+pca_result <- prcomp(scaled_data, center = TRUE, scale. = TRUE)
+
+# Examine the PCA results
+summary(pca_result)
+
+# Calculate proportion of variance explained by each component
+explained_variance <- (pca_result$sdev)^2 / sum(pca_result$sdev^2)
+cumulative_variance <- cumsum(explained_variance)
+
+# Create data frame for plotting
+pca_var_df <- data.frame(
+  PC = 1:length(explained_variance),
+  Individual = explained_variance,
+  Cumulative = cumulative_variance
+)
+
+# Plot cumulative variance using ggplot2
+library(ggplot2)
+
+cumulative_plot <- ggplot(pca_var_df, aes(x = PC)) +
+  geom_col(aes(y = Individual), fill = "skyblue", alpha = 0.7) +
+  geom_line(aes(y = Cumulative), color = "red", size = 1.2) +
+  geom_point(aes(y = Cumulative), color = "red", size = 3) +
+  geom_hline(yintercept = 0.8, linetype = "dashed", color = "gray40") +
+  annotate("text", x = length(explained_variance) - 2, y = 0.82, 
+           label = "80% threshold", color = "gray40", size = 4) +
+  labs(
+    title = "PCA Cumulative Variance Explained",
+    x = "Principal Component",
+    y = "Proportion of Variance"
+  ) +
+  scale_y_continuous(
+    labels = scales::percent_format(),
+    sec.axis = sec_axis(~., name = "Cumulative Variance", labels = scales::percent_format())
+  ) +
+  theme_minimal()
+
+# Display the plot
+print(cumulative_plot)
+
+# Visualize variance explained by each principal component
+pca_var <- fviz_eig(pca_result, addlabels = TRUE, ylim = c(0, 50))
+print(pca_var)
+
+# Determine number of components to retain (explain at least 80% variance)
+cumulative_variance <- cumsum(pca_result$sdev^2) / sum(pca_result$sdev^2)
+num_components <- which(cumulative_variance >= 0.80)[1]
+cat("Number of principal components required to explain 80% variance:", num_components, "\n")
+
+'
+Number of principal components required to explain 80% variance: 11 
+'
+# Extract the chosen principal components
+pca_data <- as.data.frame(pca_result$x[, 1:num_components])
+
+# Add the target variable back
+pca_data$Credit_Score <- credit_score
+
+# Print the dimensions of the transformed dataset
+cat("Original dimensions:", dim(credit_data), "\n")
+cat("After PCA dimensions:", dim(pca_data), "\n")
+
+# Model saving and loading functionality
+# Add this code before the model training section in your original script
+
+# Create directory for saving models (if it doesn't exist)
+model_dir <- "saved_models"
+if (!dir.exists(model_dir)) {
+  dir.create(model_dir)
+  cat("Created model directory:", model_dir, "\n")
+}
+
+# Define a function to check if a model exists, and load or train it
+train_or_load_model <- function(model_name, train_func, model_file = NULL) {
+  if (is.null(model_file)) {
+    model_file <- file.path(model_dir, paste0(model_name, ".RData"))
+  }
+  
+  # Check if model file exists
+  if (file.exists(model_file)) {
+    cat(paste0("Loading existing ", model_name, " model...\n"))
+    load(model_file)
+    return(get(paste0(model_name, "_model")))
+  } else {
+    cat(paste0("Training new ", model_name, " model...\n"))
+    model <- train_func()
+    # Save model to file
+    assign(paste0(model_name, "_model"), model)
+    save(list = paste0(model_name, "_model"), file = model_file)
+    cat(paste0("Model saved to: ", model_file, "\n"))
+    return(model)
+  }
+}
+
+# Split data into training and testing sets (80/20 split)
+train_index <- createDataPartition(pca_data$Credit_Score, p = 0.8, list = FALSE)
+train_data <- pca_data[train_index, ]
+test_data <- pca_data[-train_index, ]
+
+# Create a formula for the model (all predictors except Credit_Score)
+formula <- as.formula("Credit_Score ~ .")
+
+# Function to evaluate model performance
+evaluate_model <- function(model, test_data, model_name) {
+  # Make predictions
+  if (model_name %in% c("k-NN")) {
+    # k-NN predicts directly without a predict method
+    predictions <- model
+  } else {
+    predictions <- predict(model, test_data)
+  }
+  
+  # Convert predictions to factor if they aren't already
+  if (!is.factor(predictions)) {
+    predictions <- as.factor(predictions)
+  }
+  
+  # Confusion matrix and model metrics
+  cm <- confusionMatrix(predictions, test_data$Credit_Score)
+  
+  # Calculate ROC (for multi-class, we'll use one-vs-rest approach)
+  roc_data <- list()
+  if (length(levels(test_data$Credit_Score)) > 2) {
+    # Multi-class ROC analysis
+    classes <- levels(test_data$Credit_Score)
+    for (i in 1:length(classes)) {
+      # Convert to binary problem
+      actual_binary <- ifelse(test_data$Credit_Score == classes[i], 1, 0)
+      
+      # For kNN, the predictions are already factors
+      if (model_name %in% c("k-NN")) {
+        pred_binary <- ifelse(predictions == classes[i], 1, 0)
+        roc_data[[i]] <- tryCatch({
+          roc(actual_binary, pred_binary)
+        }, error = function(e) {
+          message("ROC calculation error for class ", classes[i])
+          NULL
+        })
+      } else {
+        # For other models that can output probabilities
+        tryCatch({
+          if (model_name %in% c("Logistic Regression", "LDA", "QDA", "SVM", "Decision Tree", "Random Forest")) {
+            # Get probabilities if available
+            probs <- predict(model, test_data, type = "prob")
+            if (!is.null(probs)) {
+              roc_data[[i]] <- roc(actual_binary, probs[,i])
+            }
+          }
+        }, error = function(e) {
+          message("Probability calculation error for ", model_name)
+        })
+      }
+    }
+  } else {
+    # Binary classification
+    if (model_name != "k-NN") {
+      probs <- tryCatch({
+        predict(model, test_data, type = "prob")[,2]
+      }, error = function(e) {
+        message("Probability calculation error for ", model_name)
+        NULL
+      })
+      
+      if (!is.null(probs)) {
+        roc_data[[1]] <- roc(as.numeric(test_data$Credit_Score) - 1, probs)
+      }
+    }
+  }
+  
+  # Calculate average AUC
+  auc_values <- sapply(roc_data, function(x) ifelse(is.null(x), NA, auc(x)))
+  avg_auc <- mean(auc_values, na.rm = TRUE)
+  
+  # Return a list of performance metrics
+  list(
+    model_name = model_name,
+    accuracy = cm$overall["Accuracy"],
+    kappa = cm$overall["Kappa"],
+    sensitivity = mean(cm$byClass[, "Sensitivity"], na.rm = TRUE),
+    specificity = mean(cm$byClass[, "Specificity"], na.rm = TRUE),
+    precision = mean(cm$byClass[, "Pos Pred Value"], na.rm = TRUE),
+    recall = mean(cm$byClass[, "Sensitivity"], na.rm = TRUE), # Recall is the same as Sensitivity
+    f1_score = mean(cm$byClass[, "F1"], na.rm = TRUE),
+    balanced_accuracy = mean(cm$byClass[, "Balanced Accuracy"], na.rm = TRUE),
+    auc = avg_auc,
+    confusion_matrix = cm$table
+  )
+}
+
+# Function to print formatted performance report
+print_performance_report <- function(performance) {
+  cat("\n===========================================================\n")
+  cat("Model:", performance$model_name, "\n")
+  cat("===========================================================\n")
+  cat("Accuracy:", round(performance$accuracy, 4), "\n")
+  cat("Kappa:", round(performance$kappa, 4), "\n")
+  cat("Balanced Accuracy:", round(performance$balanced_accuracy, 4), "\n")
+  cat("Sensitivity (Recall):", round(performance$sensitivity, 4), "\n")
+  cat("Specificity:", round(performance$specificity, 4), "\n")
+  cat("Precision:", round(performance$precision, 4), "\n")
+  cat("F1 Score:", round(performance$f1_score, 4), "\n")
+  if (!is.na(performance$auc)) {
+    cat("AUC:", round(performance$auc, 4), "\n")
+  }
+  cat("\nConfusion Matrix:\n")
+  print(performance$confusion_matrix)
+  cat("\n")
+}
+```
+</details>
+# Model Used
+A total of seven classification models were evaluated, grouped into three categories: linear models (e.g., Logistic Regression, LDA), non-linear models (e.g., QDA, k-NN, SVM, Decision Tree), and ensemble methods (Random Forest). All models were trained using 5-fold cross-validation to ensure reliable performance estimates. Additionally, automated hyperparameter tuning was employed to optimize each model’s performance and generalization capability.
+
+## 1. Logistic Regression
+Logistic Regression is a fundamental linear classification algorithm commonly used for binary classification tasks. It models the relationship between a set of independent variables and a binary dependent variable using the logistic function. The output represents the probability of belonging to a particular class, making it especially suitable for problems where interpretability and computational efficiency are important.
+
+<details>
+<summary>Click to expand</summary>
+```{r}
+# 1. Logistic Regression
+lr_model <- train_or_load_model("lr", function() {
+  cat("\nTraining Logistic Regression model...\n")
+  train(formula, 
+        data = train_data,
+        method = "multinom",
+        trace = FALSE,
+        trControl = trainControl(method = "cv", number = 5))
+})
+lr_performance <- evaluate_model(lr_model, test_data, "Logistic Regression")
+print_performance_report(lr_performance)
+
+```
+</details>
+
+## 2. Linear Discriminant Analysis (LDA)
+LDA is a statistical method used for classification that assumes normal distribution of the features and equal covariance across classes. It aims to find the linear combination of features that best separates two or more classes. LDA is particularly effective when class distributions are roughly similar and is also used for dimensionality reduction in preprocessing steps.
+<details>
+<summary>Click to expand</summary>
+```{r}
+# 2. Linear Discriminant Analysis (LDA)
+lda_model <- train_or_load_model("lda", function() {
+  cat("\nTraining LDA model...\n")
+  train(formula, 
+        data = train_data,
+        method = "lda",
+        trControl = trainControl(method = "cv", number = 5))
+})
+lda_performance <- evaluate_model(lda_model, test_data, "LDA")
+print_performance_report(lda_performance)
+```
+</details>
+
+## 3. Quadratic Discriminant Analysis (QDA)
+QDA is a generalization of LDA that relaxes the assumption of equal covariance matrices among classes. This allows the model to capture more complex, non-linear decision boundaries. It is well-suited to datasets where classes exhibit distinct variances or covariances, although it requires more parameters to be estimated, increasing sensitivity to data scarcity.
+<details>
+<summary>Click to expand</summary>
+```{r}
+# 3. Quadratic Discriminant Analysis (QDA)
+qda_model <- train_or_load_model("qda", function() {
+  cat("\nTraining QDA model...\n")
+  train(formula, 
+        data = train_data,
+        method = "qda",
+        trControl = trainControl(method = "cv", number = 5))
+})
+qda_performance <- evaluate_model(qda_model, test_data, "QDA")
+print_performance_report(qda_performance)
+```
+</details>
+## 4. k-Nearest Neighbors (k-NN)
+k-NN is a non-parametric classification algorithm that assigns a class label based on the majority class among the k closest training examples in the feature space. It makes no assumptions about data distribution and is highly flexible, but its performance can be affected by the choice of distance metric, the value of k, and the presence of irrelevant features.
+<details>
+<summary>Click to expand</summary>
+```{r}
+# 4. k-Nearest Neighbors (k-NN)
+knn_params_file <- file.path(model_dir, "knn_params.RData")
+if (file.exists(knn_params_file)) {
+  cat("\nLoading existing k-NN parameters...\n")
+  load(knn_params_file)
+} else {
+  cat("\nTraining k-NN model and determining best parameters...\n")
+  # Scale the data for k-NN
+  train_scaled <- scale(train_data[, -which(names(train_data) == "Credit_Score")])
+  test_scaled <- scale(test_data[, -which(names(test_data) == "Credit_Score")])
+  
+  # Find optimal k
+  set.seed(123)
+  k_grid <- expand.grid(k = seq(3, 21, by = 2))
+  knn_model <- train(
+    x = train_scaled,
+    y = train_data$Credit_Score,
+    method = "knn",
+    tuneGrid = k_grid,
+    trControl = trainControl(method = "cv", number = 5)
+  )
+  
+  # Use the optimal k
+  optimal_k <- knn_model$bestTune$k
+  # Save training data, test data and optimal k
+  save(train_scaled, test_scaled, train_data, optimal_k, file = knn_params_file)
+  cat("k-NN parameters saved to:", knn_params_file, "\n")
+}
+
+# Use loaded or newly generated parameters for prediction
+cat("Using optimal k value:", optimal_k, "\n")
+# If not defined, compute scaled data
+if (!exists("train_scaled") || !exists("test_scaled")) {
+  train_scaled <- scale(train_data[, -which(names(train_data) == "Credit_Score")])
+  test_scaled <- scale(test_data[, -which(names(test_data) == "Credit_Score")])
+}
+
+# Predict using k-NN
+knn_pred <- knn(
+  train = train_scaled,
+  test = test_scaled,
+  cl = train_data$Credit_Score,
+  k = optimal_k
+)
+
+knn_performance <- evaluate_model(knn_pred, test_data, "k-NN")
+print_performance_report(knn_performance)
+```
+</details>
+## 5. Support Vector Machine (SVM)
+SVM is a robust and versatile classification algorithm that constructs an optimal separating hyperplane by maximizing the margin between classes. It can handle both linear and non-linear classification tasks through the use of kernel functions. SVM is particularly effective in high-dimensional spaces and is known for its strong theoretical foundations and generalization capabilities.
+<details>
+<summary>Click to expand</summary>
+```{r}
+# 5. Support Vector Machine (SVM)
+svm_model <- train_or_load_model("svm", function() {
+  cat("\nTraining SVM model...\n")
+  train(formula,
+        data = train_data,
+        method = "svmRadial",
+        trControl = trainControl(method = "cv", number = 5),
+        tuneLength = 10)
+})
+svm_performance <- evaluate_model(svm_model, test_data, "SVM")
+print_performance_report(svm_performance)
+```
+</details>
+## 6. Decision Tree
+A Decision Tree is a tree-based model that partitions the input space recursively by selecting features that best separate the classes at each node. The model is easy to interpret and implement, and can handle both numerical and categorical data. However, it is prone to overfitting, especially when the tree grows deep without proper pruning.
+<details>
+<summary>Click to expand</summary>
+```{r}
+# 6. Decision Tree
+dt_model <- train_or_load_model("dt", function() {
+  cat("\nTraining Decision Tree model...\n")
+  train(formula,
+        data = train_data,
+        method = "rpart",
+        trControl = trainControl(method = "cv", number = 5),
+        tuneLength = 20)
+})
+dt_performance <- evaluate_model(dt_model, test_data, "Decision Tree")
+print_performance_report(dt_performance)
+```
+</details>
+## 7. Random Forest
+Random Forest is an ensemble method that builds multiple decision trees and aggregates their outputs to improve classification performance. By combining the predictions of various trees trained on random subsets of data and features, it reduces the variance associated with individual trees and enhances robustness. Random Forests are widely used for their high accuracy and resistance to overfitting.
+<details>
+<summary>Click to expand</summary>
+```{r}
+# 7. Random Forest
+rf_model <- train_or_load_model("rf", function() {
+  cat("\nTraining Random Forest model...\n")
+  train(formula,
+        data = train_data,
+        method = "rf",
+        trControl = trainControl(method = "cv", number = 5),
+        tuneLength = 10)
+})
+rf_performance <- evaluate_model(rf_model, test_data, "Random Forest")
+print_performance_report(rf_performance)
+```
+</details>
+# Evaluation
+## Evaluation Metrics 
+The performance of each model was assessed using multiple metrics, including Accuracy, Precision, Recall, F1 Score, and Area Under the ROC Curve (AUC). Confusion matrices and ROC curves were analyzed to provide deeper insights into the classification behavior. For multi-class classification tasks, AUC was calculated using the one-vs-rest (OvR) strategy to accommodate comparisons across different class boundaries.
+
+## Performance Evaluation
+Among the tested models, Random Forest demonstrated the most balanced and robust performance, achieving the highest AUC score. It consistently outperformed other models across all key evaluation metrics. Its superior ability to distinguish between different classes makes it the most suitable candidate for deployment in practical classification tasks.
+
+![metrics_comparison](metrics_comparison.png)
+<details>
+<summary>Click to expand</summary>
+```{r}
+
+# Collect all performance metrics in a data frame
+all_models <- list(
+  lr_performance,
+  lda_performance,
+  qda_performance,
+  knn_performance,
+  svm_performance,
+  dt_performance,
+  rf_performance
+)
+
+performance_summary <- data.frame(
+  Model = sapply(all_models, function(x) x$model_name),
+  Accuracy = sapply(all_models, function(x) x$accuracy),
+  Kappa = sapply(all_models, function(x) x$kappa),
+  Sensitivity = sapply(all_models, function(x) x$sensitivity),
+  Specificity = sapply(all_models, function(x) x$specificity),
+  Precision = sapply(all_models, function(x) x$precision),
+  F1_Score = sapply(all_models, function(x) x$f1_score),
+  Balanced_Accuracy = sapply(all_models, function(x) x$balanced_accuracy),
+  AUC = sapply(all_models, function(x) x$auc)
+)
+
+# Sort by accuracy
+performance_summary <- performance_summary[order(-performance_summary$Accuracy), ]
+
+# Print the summary table
+cat("\n========================= MODEL COMPARISON =========================\n")
+print(performance_summary, digits = 4)
+```
+</details>
+
+## Insight
+
+A closer examination of model predictions revealed that Random Forest performs significantly better on class 1 compared to classes 0 and 2. This indicates a classification bias toward the middle class. The confusion matrix and class-wise precision/recall values confirm this tendency and suggest potential room for improvement in handling edge cases.
+![confusion_matrix](confusion_matrix.png)
+<details>
+<summary>Click to expand</summary>
+```{r}
+best_model_cm <- rf_performance$confusion_matrix
+
+# Convert to dataframe for ggplot
+cm_df <- as.data.frame(as.table(best_model_cm))
+colnames(cm_df) <- c("Predicted", "Actual", "Frequency")
+
+# Create confusion matrix heatmap
+confusion_plot <- ggplot(cm_df, aes(x = Actual, y = Predicted, fill = Frequency)) +
+  geom_tile() +
+  geom_text(aes(label = Frequency), color = "white", size = 5) +
+  scale_fill_gradient(low = "steelblue", high = "darkred") +
+  theme_minimal() +
+  labs(title = "Confusion Matrix Heatmap - Random Forest",
+       x = "Actual Credit Score",
+       y = "Predicted Credit Score") +
+  theme(axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        plot.title = element_text(size = 16, face = "bold"))
+
+# Display confusion matrix heatmap
+print(confusion_plot)
+```
+</details>
+
+Random Forest also provides insight into feature importance through its internal structure. The analysis identified the top 10 most influential features contributing to classification outcomes. This information is valuable not only for model interpretability but also for guiding future data collection, feature engineering, and decision-making in model refinement.
+![Feature Importance](random_forest_feature_importance_colored.png)
+<details>
+<summary>Click to expand</summary>
+```{r}
+# Random Forest Feature Importance Visualization
+# Add this code after your Random Forest model training
+
+
+
+# Extract feature importance from the trained Random Forest model
+# Note: rf_model should be your trained Random Forest model from the previous code
+feature_importance <- varImp(rf_model, scale = FALSE)
+
+# Convert to data frame for plotting
+importance_df <- data.frame(
+  Feature = rownames(feature_importance$importance),
+  Importance = feature_importance$importance$Overall
+)
+
+# Sort by importance and select top 10
+top_features <- importance_df %>%
+  arrange(desc(Importance)) %>%
+  slice_head(n = 10)
+
+# Create the feature importance plot
+feature_plot <- ggplot(top_features, aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_col(fill = "steelblue", alpha = 0.8, width = 0.7) +
+  geom_text(aes(label = round(Importance, 2)), 
+            hjust = -0.1, size = 3.5, color = "darkblue") +
+  coord_flip() +
+  labs(
+    title = "Random Forest Feature Importance",
+    subtitle = "Top 10 Most Important Features",
+    x = "Features (Principal Components)",
+    y = "Importance Score",
+    caption = "Based on PCA-transformed features"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5, color = "gray60"),
+    axis.title = element_text(size = 12, face = "bold"),
+    axis.text = element_text(size = 10),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.background = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA)
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1)))
+
+# Display the plot
+print(feature_plot)
+
+# Optional: Save the plot
+ggsave("random_forest_feature_importance.png", 
+       plot = feature_plot, 
+       width = 10, height = 6, 
+       dpi = 300, 
+       bg = "white")
+
+# Print the top 10 features with their importance scores
+cat("\n=== Top 10 Most Important Features ===\n")
+for(i in 1:nrow(top_features)) {
+  cat(sprintf("%2d. %-8s: %.4f\n", 
+              i, 
+              top_features$Feature[i], 
+              top_features$Importance[i]))
+}
+
+# Alternative visualization: Horizontal bar plot with different colors
+feature_plot_alt <- ggplot(top_features, aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_col(aes(fill = Importance), alpha = 0.8, width = 0.7) +
+  geom_text(aes(label = round(Importance, 2)), 
+            hjust = -0.1, size = 3.5, color = "white", fontface = "bold") +
+  coord_flip() +
+  scale_fill_gradient(low = "lightblue", high = "darkblue", name = "Importance") +
+  labs(
+    title = "Random Forest Feature Importance Analysis",
+    subtitle = "Top 10 Principal Components Ranked by Importance",
+    x = "Principal Components",
+    y = "Variable Importance Score",
+    caption = "Higher scores indicate greater contribution to model predictions"
+  ) +
+  theme_classic() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5, color = "gray50"),
+    axis.title = element_text(size = 12, face = "bold"),
+    axis.text = element_text(size = 10),
+    legend.position = "right",
+    legend.title = element_text(face = "bold"),
+    plot.background = element_rect(fill = "white", color = NA)
+  )
+
+# Display the alternative plot
+print(feature_plot_alt)
+
+# Optional: Save the alternative plot
+ggsave("random_forest_feature_importance_colored.png", 
+       plot = feature_plot_alt, 
+       width = 12, height = 7, 
+       dpi = 300, 
+       bg = "white")
+
+# Additional analysis: Feature importance statistics
+cat("\n=== Feature Importance Statistics ===\n")
+cat("Mean Importance:", round(mean(importance_df$Importance), 4), "\n")
+cat("Median Importance:", round(median(importance_df$Importance), 4), "\n")
+cat("Standard Deviation:", round(sd(importance_df$Importance), 4), "\n")
+cat("Range:", round(min(importance_df$Importance), 4), "to", round(max(importance_df$Importance), 4), "\n")
+
+# Calculate percentage contribution of top 10 features
+total_importance <- sum(importance_df$Importance)
+top_10_contribution <- sum(top_features$Importance)
+percentage_contribution <- (top_10_contribution / total_importance) * 100
+
+cat("\nTop 10 features contribute", round(percentage_contribution, 2), "% of total importance\n")
+```
+</details>
+
+To further assess the robustness of the Random Forest model, we analyzed how its performance evolves with an increasing number of decision trees (estimators). As illustrated in the corresponding plot, the out-of-bag (OOB) error rate consistently decreases as more trees are added, eventually stabilizing at a lower value. This trend indicates enhanced model stability and a reduction in variance, affirming the benefit of ensemble aggregation. The diminishing returns beyond a certain point also help inform the trade-off between model complexity and computational efficiency.
+![Error_Rate](error Rate.png)
+<details>
+<summary>Click to expand</summary>
+```{r}
+# Random Forest Error Rate Visualization
+# Add this code after your Random Forest model training
+
+library(ggplot2)
+library(dplyr)
+library(reshape2)
+library(randomForest)
+
+# Method 1: If you want to retrain the model to get error rates
+# (This gives you access to the err.rate component)
+cat("Training Random Forest for error rate analysis...\n")
+
+# Prepare the data (same as before)
+train_features <- train_data[, -which(names(train_data) == "Credit_Score")]
+train_target <- train_data$Credit_Score
+
+# Train Random Forest with explicit parameters to track error rates
+set.seed(123)
+rf_model_error <- randomForest(
+  x = train_features,
+  y = train_target,
+  ntree = 500,           # Number of trees
+  mtry = sqrt(ncol(train_features)),  # Number of variables to try at each split
+  importance = TRUE,     # Calculate importance
+  keep.forest = TRUE,    # Keep the forest for predictions
+  do.trace = 50          # Print progress every 50 trees
+)
+
+# Extract error rates
+error_rates <- rf_model_error$err.rate
+ntrees <- 1:nrow(error_rates)
+
+# Convert to data frame for plotting
+error_df <- data.frame(
+  Trees = ntrees,
+  OOB = error_rates[, "OOB"]  # Out-of-bag error
+)
+
+# Add class-specific error rates if available
+if(ncol(error_rates) > 1) {
+  class_names <- colnames(error_rates)[-1]  # Exclude OOB column
+  for(i in 1:length(class_names)) {
+    error_df[[paste0("Class_", class_names[i])]] <- error_rates[, class_names[i]]
+  }
+}
+
+# Create the main error rate plot
+error_plot <- ggplot(error_df, aes(x = Trees)) +
+  geom_line(aes(y = OOB, color = "OOB Error"), size = 1.2, alpha = 0.8) +
+  labs(
+    title = "Random Forest Error Rate Convergence",
+    subtitle = "Out-of-Bag (OOB) Error Rate vs Number of Trees",
+    x = "Number of Trees",
+    y = "Error Rate",
+    color = "Error Type"
+  ) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  scale_color_manual(values = c("OOB Error" = "red")) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5, color = "gray60"),
+    axis.title = element_text(size = 12, face = "bold"),
+    axis.text = element_text(size = 10),
+    legend.position = "bottom",
+    legend.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+print(error_plot)
+
+# Enhanced plot with class-specific error rates
+if(ncol(error_rates) > 1) {
+  # Reshape data for plotting multiple lines
+  error_long <- melt(error_df, id.vars = "Trees", variable.name = "Error_Type", value.name = "Error_Rate")
+  
+  # Create enhanced plot with all error rates
+  error_plot_enhanced <- ggplot(error_long, aes(x = Trees, y = Error_Rate, color = Error_Type)) +
+    geom_line(size = 1.1, alpha = 0.8) +
+    labs(
+      title = "Random Forest Error Rate Analysis",
+      subtitle = "OOB and Class-Specific Error Rates vs Number of Trees",
+      x = "Number of Trees",
+      y = "Error Rate",
+      color = "Error Type"
+    ) +
+    scale_y_continuous(labels = scales::percent_format()) +
+    scale_color_manual(
+      values = c("OOB" = "red", 
+                 "Class_0" = "blue", 
+                 "Class_1" = "green", 
+                 "Class_2" = "orange"),
+      labels = c("OOB" = "Overall OOB", 
+                 "Class_0" = "Class 0", 
+                 "Class_1" = "Class 1", 
+                 "Class_2" = "Class 2")
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(size = 12, hjust = 0.5, color = "gray60"),
+      axis.title = element_text(size = 12, face = "bold"),
+      axis.text = element_text(size = 10),
+      legend.position = "bottom",
+      legend.title = element_text(face = "bold"),
+      panel.grid.minor = element_blank()
+    )
+  
+  print(error_plot_enhanced)
+  
+  # Save the enhanced plot
+  ggsave("random_forest_error_rates_enhanced.png", 
+         plot = error_plot_enhanced, 
+         width = 12, height = 8, 
+         dpi = 300, 
+         bg = "white")
+}
+
+# Method 2: Alternative approach using cross-validation error
+# This method evaluates error at different ntree values
+cat("\nEvaluating error rates at different tree counts...\n")
+
+# Define different numbers of trees to test
+tree_counts <- seq(50, 500, by = 50)
+cv_errors <- numeric(length(tree_counts))
+
+# Calculate error for each tree count
+for(i in 1:length(tree_counts)) {
+  cat("Testing with", tree_counts[i], "trees...\n")
+  
+  # Train model with specific number of trees
+  temp_rf <- randomForest(
+    x = train_features,
+    y = train_target,
+    ntree = tree_counts[i],
+    mtry = sqrt(ncol(train_features)),
+    importance = FALSE  # Skip importance calculation for speed
+  )
+  
+  # Calculate OOB error rate
+  cv_errors[i] <- mean(predict(temp_rf) != train_target)
+}
+
+# Create data frame for alternative plot
+alt_error_df <- data.frame(
+  Trees = tree_counts,
+  Error_Rate = cv_errors
+)
+
+# Create alternative visualization
+alt_error_plot <- ggplot(alt_error_df, aes(x = Trees, y = Error_Rate)) +
+  geom_line(color = "darkred", size = 1.2) +
+  geom_point(color = "darkred", size = 2.5, alpha = 0.7) +
+  geom_smooth(method = "loess", se = TRUE, color = "blue", alpha = 0.3) +
+  labs(
+    title = "Random Forest Error Rate Optimization",
+    subtitle = "Training Error Rate vs Number of Trees",
+    x = "Number of Trees",
+    y = "Training Error Rate"
+  ) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  theme_classic() +
+  theme(
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5, color = "gray60"),
+    axis.title = element_text(size = 12, face = "bold"),
+    axis.text = element_text(size = 10)
+  )
+
+print(alt_error_plot)
+
+# Save plots
+ggsave("random_forest_oob_error.png", 
+       plot = error_plot, 
+       width = 10, height = 6, 
+       dpi = 300, 
+       bg = "white")
+
+ggsave("random_forest_error_optimization.png", 
+       plot = alt_error_plot, 
+       width = 10, height = 6, 
+       dpi = 300, 
+       bg = "white")
+
+# Print summary statistics
+cat("\n=== Error Rate Analysis Summary ===\n")
+cat("Final OOB Error Rate:", round(tail(error_df$OOB, 1) * 100, 2), "%\n")
+cat("Minimum OOB Error Rate:", round(min(error_df$OOB) * 100, 2), "%\n")
+cat("Error Rate Stabilization Point:", which.min(diff(error_df$OOB)), "trees\n")
+
+# Find optimal number of trees
+optimal_trees <- tree_counts[which.min(cv_errors)]
+cat("Optimal Number of Trees (from CV):", optimal_trees, "\n")
+cat("Corresponding Error Rate:", round(min(cv_errors) * 100, 2), "%\n")
+
+# Additional diagnostic: Variable importance from the final model
+cat("\n=== Top 5 Most Important Variables ===\n")
+importance_scores <- importance(rf_model_error)
+if(!is.null(importance_scores)) {
+  top_vars <- head(sort(importance_scores[, "MeanDecreaseGini"], decreasing = TRUE), 5)
+  for(i in 1:length(top_vars)) {
+    cat(sprintf("%d. %s: %.2f\n", i, names(top_vars)[i], top_vars[i]))
+  }
+}
+
+# Model performance summary
+cat("\n=== Model Performance Summary ===\n")
+cat("Number of Trees:", rf_model_error$ntree, "\n")
+cat("Number of Variables Tried:", rf_model_error$mtry, "\n")
+cat("OOB Error Rate:", round(tail(rf_model_error$err.rate[, "OOB"], 1) * 100, 2), "%\n")
+if(ncol(rf_model_error$err.rate) > 1) {
+  class_errors <- tail(rf_model_error$err.rate, 1)
+  for(i in 2:ncol(class_errors)) {
+    cat("Class", colnames(class_errors)[i], "Error Rate:", 
+        round(class_errors[1, i] * 100, 2), "%\n")
+  }
+}
+```
+</details>
+
